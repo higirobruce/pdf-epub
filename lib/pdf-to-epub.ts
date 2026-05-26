@@ -18,6 +18,14 @@ function escapeHtml(text: string): string {
     .replace(/"/g, '&quot;')
 }
 
+// Remove characters pdfjs can't map to Unicode (shown as □ in e-readers)
+function cleanStr(str: string): string {
+  return str
+    .replace(/[-]/g, '') // Private Use Area — unmapped glyphs
+    .replace(/�/g, '')           // Unicode replacement character
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '') // stray control chars
+}
+
 async function getPdfjs() {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const pdfjs = require('pdfjs-dist') as typeof import('pdfjs-dist')
@@ -28,16 +36,10 @@ async function getPdfjs() {
 async function extractChapters(pdfBuffer: Buffer): Promise<{ chapters: Chapter[]; title: string; author: string }> {
   const pdfjsLib = await getPdfjs()
 
-  const doc = await pdfjsLib.getDocument({
-    data: new Uint8Array(pdfBuffer),
-    useSystemFonts: true,
-    disableFontFace: true,
-  }).promise
+  const doc = await pdfjsLib.getDocument({ data: new Uint8Array(pdfBuffer) }).promise
 
   const meta = await doc.getMetadata()
   const info = (meta.info || {}) as Record<string, string>
-  const pdfTitle = info['Title'] || ''
-  const pdfAuthor = info['Author'] || ''
 
   const chapters: Chapter[] = []
 
@@ -45,33 +47,69 @@ async function extractChapters(pdfBuffer: Buffer): Promise<{ chapters: Chapter[]
     const page = await doc.getPage(pageNum)
     const content = await page.getTextContent()
 
-    // Group items into lines by Y position (PDF Y axis is bottom-up)
+    // Group text items into lines by rounded Y position (PDF Y is bottom-up)
     const lineMap = new Map<number, string[]>()
-
     for (const item of content.items) {
-      if (!('str' in item) || !item.str) continue
+      if (!('str' in item)) continue
+      const s = cleanStr(item.str)
+      if (!s) continue
       const y = Math.round(item.transform[5])
       if (!lineMap.has(y)) lineMap.set(y, [])
-      lineMap.get(y)!.push(item.str)
+      lineMap.get(y)!.push(s)
     }
-
     if (lineMap.size === 0) continue
 
-    // Sort lines top-to-bottom (higher Y = higher on page in PDF coords)
-    const sortedYs = Array.from(lineMap.keys()).sort((a, b) => b - a)
-    const lines = sortedYs.map((y) => lineMap.get(y)!.join('').trim()).filter(Boolean)
+    // Build sorted (top→bottom) line list with their Y positions
+    const lines = Array.from(lineMap.entries())
+      .sort((a, b) => b[0] - a[0]) // higher Y = higher on page
+      .map(([y, parts]) => ({ y, text: parts.join('').trim() }))
+      .filter((l) => l.text.length > 0)
 
-    const htmlParts = lines.map((line) => {
-      const isHeading =
-        line.length < 80 && line === line.toUpperCase() && /[A-Z]/.test(line)
-      const safe = escapeHtml(line)
-      return isHeading ? `<h2>${safe}</h2>` : `<p>${safe}</p>`
-    })
+    if (lines.length === 0) continue
 
-    chapters.push({ pageNum, html: htmlParts.join('\n') })
+    // Detect typical line spacing so we can recognise paragraph breaks
+    const gaps = lines.slice(0, -1).map((l, i) => l.y - lines[i + 1].y)
+    const sorted = [...gaps].sort((a, b) => a - b)
+    const medianGap = sorted[Math.floor(sorted.length / 2)] ?? 12
+    const paraBreakThreshold = medianGap * 1.4 // gap > 1.4× median → new paragraph
+
+    // Merge PDF lines into logical paragraphs
+    const paragraphs: string[] = []
+    let current = lines[0].text
+
+    for (let i = 1; i < lines.length; i++) {
+      const gap = lines[i - 1].y - lines[i].y
+
+      if (gap > paraBreakThreshold) {
+        // Paragraph boundary
+        paragraphs.push(current)
+        current = lines[i].text
+      } else if (current.endsWith('-')) {
+        // De-hyphenate split words (e.g. "his-\ntory" → "history")
+        current = current.slice(0, -1) + lines[i].text
+      } else {
+        // Same paragraph — join with a space
+        current += ' ' + lines[i].text
+      }
+    }
+    paragraphs.push(current)
+
+    const htmlParts = paragraphs
+      .map((para) => {
+        const text = para.trim()
+        if (!text) return ''
+        const safe = escapeHtml(text)
+        const isHeading = text.length < 80 && text === text.toUpperCase() && /[A-Z]/.test(text)
+        return isHeading ? `<h2>${safe}</h2>` : `<p>${safe}</p>`
+      })
+      .filter(Boolean)
+
+    if (htmlParts.length > 0) {
+      chapters.push({ pageNum, html: htmlParts.join('\n') })
+    }
   }
 
-  return { chapters, title: pdfTitle, author: pdfAuthor }
+  return { chapters, title: info['Title'] || '', author: info['Author'] || '' }
 }
 
 function buildEpubXml(id: string, title: string, author: string, chapterIds: string[]): string {
