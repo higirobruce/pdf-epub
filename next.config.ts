@@ -1,13 +1,8 @@
 import type { NextConfig } from 'next'
 
 const nextConfig: NextConfig = {
-  // Keep pdfjs-dist out of webpack so it runs as native ESM in Node.js
+  // Keep pdfjs-dist out of the bundler — it runs as native Node.js module
   serverExternalPackages: ['pdfjs-dist'],
-  webpack: (config) => {
-    config.resolve.alias.canvas = false
-    config.resolve.alias.encoding = false
-    return config
-  },
 }
 
 export default nextConfig
